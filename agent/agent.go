@@ -51,6 +51,7 @@ import (
 	"github.com/google/inverting-proxy/agent/sessions"
 	"github.com/google/inverting-proxy/agent/utils"
 	"github.com/google/inverting-proxy/agent/websockets"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -78,6 +79,7 @@ var (
 	healthCheckFreq           = flag.Int("health-check-interval-seconds", 0, "Wait time in seconds between health checks.  Set to zero to disable health checks.  Checks disabled by default.")
 	healthCheckUnhealthy      = flag.Int("health-check-unhealthy-threshold", 2, "A so-far healthy backend will be marked unhealthy after this many consecutive failures. The minimum value is 1.")
 	disableGCEVM              = flag.Bool("disable-gce-vm-header", false, "Disable the agent from adding a GCE VM header.")
+	disableGCPAuth            = flag.Bool("disable-gcp-auth", false, "Disable Google Cloud authentication and use a default HTTP client")
 	enableWebsocketsInjection = flag.Bool("enable-websockets-injection", false, "Enables the injection of HTTP headers into websocket messages. "+
 		"Websocket message injection will inject all headers from the HTTP request to /data and inject them "+
 		"into JSON-serialized websocket messages at the JSONPath `resource.headers`")
@@ -157,6 +159,92 @@ func forwardRequest(client *http.Client, hostProxy http.Handler, request *utils.
 	if *stripCredentials {
 		httpRequest.Header.Del(headerAuthorization)
 	}
+	// Special-case CONNECT tunneling: establish a websocket back to the proxy and
+	// connect it to the desired target host:port from the agent side.
+	if httpRequest.Method == http.MethodConnect {
+		target := httpRequest.Host
+		if target == "" {
+			return fmt.Errorf("CONNECT request missing host")
+		}
+
+		// Dial the target from the agent (agent must be able to reach the target)
+		backendConn, err := net.Dial("tcp", target)
+		if err != nil {
+			return fmt.Errorf("failed to connect to target %s: %v", target, err)
+		}
+
+		// Build websocket URL to proxy's tcp-bridge path
+		proxyURL, err := url.Parse(*proxy)
+		if err != nil {
+			backendConn.Close()
+			return fmt.Errorf("invalid proxy URL %s: %v", *proxy, err)
+		}
+		wsScheme := "ws"
+		if proxyURL.Scheme == "https" {
+			wsScheme = "wss"
+		}
+		// ensure trailing slash handling
+		bridgePath := "/tcp-bridge/" + request.RequestID
+		u := url.URL{Scheme: wsScheme, Host: proxyURL.Host, Path: bridgePath}
+
+		// Dial websocket to proxy
+		wsConn, resp, err := websocket.DefaultDialer.Dial(u.String(), nil)
+		if err != nil {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			backendConn.Close()
+			return fmt.Errorf("failed to dial bridge websocket %s: %v", u.String(), err)
+		}
+
+		// Start copying data between backendConn and wsConn
+		errCh := make(chan error, 2)
+
+		// ws -> backendConn
+		go func() {
+			defer backendConn.Close()
+			defer wsConn.Close()
+			for {
+				_, msg, err := wsConn.ReadMessage()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := backendConn.Write(msg); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+
+		// backendConn -> ws (binary frames)
+		go func() {
+			defer backendConn.Close()
+			defer wsConn.Close()
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := backendConn.Read(buf)
+				if n > 0 {
+					if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+						errCh <- err
+						return
+					}
+				}
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+
+		// wait for copy to end
+		err = <-errCh
+		if err != nil && *debug {
+			log.Printf("bridge copy error: %v", err)
+		}
+		return nil
+	}
+
 	responseForwarder, err := utils.NewResponseForwarder(client, *proxy, request.BackendID, request.RequestID, request.Contents, metricHandler)
 	if err != nil {
 		return fmt.Errorf("failed to create the response forwarder: %v", err)
@@ -233,6 +321,9 @@ func pollForNewRequests(pollingCtx context.Context, client *http.Client, hostPro
 }
 
 func getGoogleClient(ctx context.Context) (*http.Client, error) {
+	if *disableGCPAuth {
+		return &http.Client{}, nil
+	}
 	sdkConfig, err := google.NewSDKConfig("")
 	if err == nil {
 		return sdkConfig.Client(ctx), nil

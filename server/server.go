@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/google/inverting-proxy/agent/utils"
+	"github.com/gorilla/websocket"
 )
 
 var (
@@ -60,6 +61,11 @@ func newPendingRequest(r *http.Request) *pendingRequest {
 	}
 }
 
+type bridgeConn struct {
+	conn      net.Conn
+	timestamp time.Time
+}
+
 type proxy struct {
 	requestIDs    chan string
 	randGenerator *rand.Rand
@@ -67,13 +73,38 @@ type proxy struct {
 	// protects the map below
 	sync.Mutex
 	requests map[string]*pendingRequest
+	// bridges maps request IDs to hijacked client connections for CONNECT tunneling.
+	bridges map[string]*bridgeConn
 }
 
 func newProxy() *proxy {
-	return &proxy{
+	p := &proxy{
 		requestIDs:    make(chan string),
 		randGenerator: rand.New(rand.NewSource(time.Now().UnixNano())),
 		requests:      make(map[string]*pendingRequest),
+		bridges:       make(map[string]*bridgeConn),
+	}
+	// Start background goroutine to clean up stale bridges
+	go p.cleanupStaleBridges()
+	return p
+}
+
+// cleanupStaleBridges closes and removes hijacked client connections that have not been paired within timeout.
+func (p *proxy) cleanupStaleBridges() {
+	timeout := 60 * time.Second // configurable if needed
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		p.Lock()
+		for id, bc := range p.bridges {
+			if now.Sub(bc.timestamp) > timeout {
+				log.Printf("Cleaning up stale bridge %s after %v", id, now.Sub(bc.timestamp))
+				bc.conn.Close()
+				delete(p.bridges, id)
+			}
+		}
+		p.Unlock()
 	}
 }
 
@@ -196,7 +227,7 @@ func (p *proxy) newID() string {
 // See: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers#hbh
 func isHopByHopHeader(name string) bool {
 	switch strings.ToLower(name) {
-	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade":
 		return true
 	default:
 		return false
@@ -204,8 +235,56 @@ func isHopByHopHeader(name string) bool {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Handle bridge websocket connections from agents at /tcp-bridge/<id>
+	if strings.HasPrefix(r.URL.Path, "/tcp-bridge/") {
+		p.handleBridgeWebsocket(w, r)
+		return
+	}
 	if backendID := r.Header.Get(utils.HeaderBackendID); backendID != "" {
 		p.handleAgentRequest(w, r, backendID)
+		return
+	}
+	// Support CONNECT by hijacking the client connection and waiting for the
+	// agent to connect back via websocket to /tcp-bridge/<id> to form a tunnel.
+	if r.Method == http.MethodConnect {
+		id := p.newID()
+
+		// Store a pending request so agents can fetch the CONNECT request.
+		pending := newPendingRequest(r)
+		p.Lock()
+		p.requests[id] = pending
+		p.Unlock()
+
+		// Enqueue the request ID so agents learn about it.
+		select {
+		case <-r.Context().Done():
+			return
+		case p.requestIDs <- id:
+		}
+
+		// Hijack the client connection to perform raw TCP tunneling.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+		clientConn, _, err := hj.Hijack()
+		if err != nil {
+			http.Error(w, "Failed to hijack connection", http.StatusInternalServerError)
+			return
+		}
+		// Write the 200 response to establish the tunnel.
+		if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n")); err != nil {
+			clientConn.Close()
+			return
+		}
+
+		// Save the client connection so that when the agent dials back to /tcp-bridge/<id>
+		// we can pair the two ends.
+		p.Lock()
+		p.bridges[id] = &bridgeConn{conn: clientConn, timestamp: time.Now()}
+		p.Unlock()
+		// Return from handler; the connection will be closed by the bridge handler when paired.
 		return
 	}
 	id := p.newID()
@@ -259,6 +338,78 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+}
+
+// handleBridgeWebsocket upgrades an incoming websocket from an agent intended to
+// bridge a TCP connection, pairs it with the previously-hijacked client
+// connection stored in p.bridges, and proxies bytes both ways.
+func (p *proxy) handleBridgeWebsocket(w http.ResponseWriter, r *http.Request) {
+	// path is /tcp-bridge/<id>
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 3 || parts[2] == "" {
+		http.Error(w, "Missing bridge id", http.StatusBadRequest)
+		return
+	}
+	id := parts[2]
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     func(r *http.Request) bool { return true },
+	}
+	wsConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade websocket for bridge %s: %v", id, err)
+		return
+	}
+
+	p.Lock()
+	bc, ok := p.bridges[id]
+	if ok {
+		delete(p.bridges, id)
+	}
+	p.Unlock()
+
+	if !ok {
+		// No client waiting for this bridge; close websocket.
+		log.Printf("No client connection waiting for bridge %s", id)
+		wsConn.Close()
+		return
+	}
+	clientConn := bc.conn
+
+	// Wrap websocket as net.Conn using gorilla websocket's NextReader/NextWriter
+	// Implement a simple adapter that reads text/binary messages as raw bytes.
+	done := make(chan struct{})
+	go func() {
+		defer wsConn.Close()
+		defer clientConn.Close()
+		// copy from websocket to clientConn
+		for {
+			_, msg, err := wsConn.ReadMessage()
+			if err != nil {
+				break
+			}
+			if _, err := clientConn.Write(msg); err != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+	// copy from clientConn to websocket
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := clientConn.Read(buf)
+		if n > 0 {
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	<-done
 }
 
 func main() {

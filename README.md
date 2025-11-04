@@ -38,6 +38,19 @@ same overhead required for any internet hosting (SSL termination, protection
 against DDoS attacks, etc).
 
 This project aims to limit the overhead of hosting a public server to just
+Using curl as an HTTP proxy
+---------------------------
+
+You can use curl with the `--proxy` option to reach services exposed by an agent via
+the server. Example:
+
+  curl --proxy http://<server-host>:<port> http://example/path
+
+Notes:
+- This proxy supports plain HTTP proxying (absolute-form requests). The server
+  strips hop-by-hop headers such as `Proxy-Connection` before forwarding to agents.
+- CONNECT (HTTPS tunneling) is not supported by the `server` binary. For raw TCP or
+  TLS forwarding use the `tcp-bridge-*` utilities which tunnel TCP over websocket.
 the proxy while still allowing anyone to run a backend.
 
 The details of how this is accomplished are outlined below.
